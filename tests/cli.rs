@@ -33,7 +33,10 @@ fn configure(cmd: &mut Command, home: &Path) {
         .env_remove("NBRANCH_AGENT")
         .env_remove("NBRANCH_MODEL")
         .env_remove("NCHAT_NICK")
-        .env_remove("NCHAT_SESSION");
+        .env_remove("NCHAT_SESSION")
+        .env_remove("NQUEUE_ID")
+        .env_remove("NQUEUE_HOME")
+        .env_remove("NQUEUE_VALKEY");
 }
 
 fn check(what: &str, out: &Output) -> String {
@@ -188,6 +191,53 @@ impl Env {
         self.git(&dir, &["push", "-q", "origin", "HEAD:master"]);
     }
 
+    /// Start a private nqueue server (in $HOME/.nqueue) with the review policy.
+    fn start_nqueue(&self) {
+        let dir = self.home().join(".nqueue");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[policies.nbranch-review]\nmode = \"compete\"\ndelivery = \"at-least-once\"\nlease-secs = 600\nmax-in-flight = 1\n",
+        )
+        .unwrap();
+        let mut cmd = Command::new(nqueue_bin());
+        cmd.arg("daemon").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        configure(&mut cmd, self.home());
+        cmd.spawn().expect("starting nqueue daemon (is nqueue installed?)");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.nq(None, &["status"]).status.success() {
+            assert!(Instant::now() < deadline, "nqueue daemon didn't start");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn nq(&self, id: Option<&str>, args: &[&str]) -> Output {
+        let mut cmd = Command::new(nqueue_bin());
+        cmd.args(args).current_dir(self.home());
+        configure(&mut cmd, self.home());
+        if let Some(id) = id {
+            cmd.env("NQUEUE_ID", id);
+        }
+        cmd.output().unwrap()
+    }
+
+    fn nq_ok(&self, id: Option<&str>, args: &[&str]) -> String {
+        check(&format!("nqueue {}", args.join(" ")), &self.nq(id, args)).trim_end().to_string()
+    }
+
+    /// Wait for a message to be delivered to the agent `id` and lease it.
+    fn dequeue(&self, id: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let out = self.nq_ok(Some(id), &["dequeue", "--max", "1"]);
+            if let Some(line) = out.lines().next() {
+                return serde_json::from_str(line).unwrap();
+            }
+            assert!(Instant::now() < deadline, "nothing was delivered to {id}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn set_repo_config(&self, toml: &str) {
         self.human_commit(".nbranch", toml, "Configure nbranch");
     }
@@ -208,6 +258,19 @@ impl Env {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+impl Drop for Env {
+    fn drop(&mut self) {
+        let sock = self.home().join(".nqueue/valkey.sock");
+        if sock.exists() {
+            let _ = Command::new("pkill").arg("-f").arg(sock).status();
+        }
+    }
+}
+
+fn nqueue_bin() -> String {
+    std::env::var("NQUEUE_BIN").unwrap_or_else(|_| "nqueue".into())
 }
 
 fn reviews(t: &Value) -> &Vec<Value> {
@@ -512,38 +575,57 @@ fn dead_workers_are_reaped_as_abandoned() {
     env.wait_terminal(2);
 }
 
+/// Wait for a review request `nick` may answer.
+fn wait_request(env: &Env, nick: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let reqs: Value = serde_json::from_str(&env.nb_ok(nick, &["requests", "--json"])).unwrap();
+        if let Some(r) = reqs.as_array().unwrap().iter().find(|r| r["message"].is_string()) {
+            return r.clone();
+        }
+        assert!(Instant::now() < deadline, "no review request arrived for {nick}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
 fn review_agent_round_trip() {
     let env = Env::new();
+    env.start_nqueue();
     env.set_repo_config(
         "[[reviewer]]\nname = \"review-agent\"\nstage = \"pre-queue\"\ncommand = \"nbranch review-agent --nick rev\"\ntimeout = \"60s\"\n",
     );
     env.commit("alice", "a.txt", "a\n", "Add a");
     env.nb_ok("alice", &["land"]);
 
-    let wait_request = || {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let reqs: Value = serde_json::from_str(&env.nb_ok("rev", &["requests", "--json"])).unwrap();
-            if let Some(r) = reqs.as_array().unwrap().first() {
-                return r.clone();
-            }
-            assert!(Instant::now() < deadline, "no review request arrived");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    };
-    let req = wait_request();
+    let req = wait_request(&env, "rev");
     let id = req["id"].as_str().unwrap().to_string();
     assert_eq!(id, "1-pre-queue-rev");
+    assert_eq!(req["queue"], "nbranch.review.rev");
     assert!(Path::new(req["worktree"].as_str().unwrap()).join("a.txt").exists());
-    env.wait_notification(&format!("rev\tnbranch review request {id}"));
+    // The request reaches rev over nqueue, leased until it's answered.
+    let d = env.dequeue("rev");
+    assert_eq!(d["message"]["id"], req["message"]);
+    assert_eq!(d["message"]["from"], "nbranch");
+    let body = d["message"]["body"].as_str().unwrap();
+    assert!(body.starts_with(&format!("nbranch review request {id}:")), "{body}");
+    assert!(d["lease_expires_at"].is_number());
 
     // Only the addressed reviewer can answer, and it must say which model it is.
     assert!(!env.nb("mallory", &["respond", &id, "accept", "--model", "m"]).status.success());
     let out = env.nb("rev", &["respond", &id, "reject"]);
     assert!(String::from_utf8_lossy(&out.stderr).contains("--model"));
     assert!(!env.nb("rev", &["respond", &id, "reject", "--model", "test-model"]).status.success());
-    env.nb_ok("rev", &["respond", &id, "reject", "--model", "test-model", "--comment", "a.txt:1: error: needs more a"]);
+    // The reviewer's session identity comes from NQUEUE_ID, as the nqueue plugins export it.
+    let mut cmd = Command::new(BIN);
+    cmd.args(["respond", &id, "reject", "--model", "test-model", "--comment", "a.txt:1: error: needs more a"])
+        .current_dir(&env.root);
+    configure(&mut cmd, env.home());
+    cmd.env("NQUEUE_ID", "rev");
+    check("respond", &cmd.output().unwrap());
+    // Responding acked the message.
+    let again = env.nq(Some("rev"), &["ack", req["message"].as_str().unwrap()]);
+    assert!(String::from_utf8_lossy(&again.stderr).contains("not leased"), "{again:?}");
 
     let t = env.wait_terminal(1);
     assert_eq!(t["state"], "rejected");
@@ -553,16 +635,69 @@ fn review_agent_round_trip() {
 
     env.commit("alice", "a.txt", "aaaa\n", "More a");
     env.nb_ok("alice", &["land"]);
-    let id = wait_request()["id"].as_str().unwrap().to_string();
-    let model_env = [("NBRANCH_MODEL", "claude-opus-5-5")];
+    let id = wait_request(&env, "rev")["id"].as_str().unwrap().to_string();
+    env.dequeue("rev");
     let mut cmd = Command::new(BIN);
     cmd.args(["respond", &id, "accept"]).current_dir(&env.root);
     configure(&mut cmd, env.home());
-    cmd.env("NBRANCH_AGENT", "rev").envs(model_env);
+    cmd.env("NBRANCH_AGENT", "rev").env("NBRANCH_MODEL", "claude-opus-5-5");
     check("respond", &cmd.output().unwrap());
     assert_eq!(env.wait_terminal(2)["state"], "landed");
     let msg = env.git(&env.golden(), &["log", "-1", "--format=%B", "master"]);
     assert!(msg.contains("Reviewed-by: review-agent [rev, claude-opus-5-5]"), "{msg}");
+}
+
+#[test]
+fn shared_review_queue_goes_to_one_reviewer() {
+    let env = Env::new();
+    env.start_nqueue();
+    env.set_repo_config(
+        "[[reviewer]]\nname = \"llm\"\nstage = \"pre-queue\"\ncommand = \"nbranch review-agent --queue reviews\"\ntimeout = \"60s\"\n",
+    );
+    env.nq_ok(None, &["create", "reviews", "--policy", "nbranch-review"]);
+    for nick in ["rev1", "rev2"] {
+        env.nq_ok(None, &["register", nick]);
+        env.nq_ok(Some(nick), &["subscribe", "reviews"]);
+    }
+    env.commit("alice", "a.txt", "a\n", "Add a");
+    env.nb_ok("alice", &["land"]);
+
+    let req = wait_request(&env, "rev1");
+    let id = req["id"].as_str().unwrap().to_string();
+    assert_eq!(id, "1-pre-queue-llm");
+    assert!(req["reviewer_nick"].is_null());
+    // The lander can't review its own land.
+    assert!(env.nb("observer", &["requests", "--json"]).status.success());
+    let mine: Value = serde_json::from_str(&env.nb_ok("alice", &["requests", "--json"])).unwrap();
+    assert!(mine.as_array().unwrap().is_empty());
+    let out = env.nb("alice", &["respond", &id, "accept", "--model", "m"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("someone else must review it"));
+
+    // One reviewer gets it; the other doesn't.
+    let d = env.dequeue("rev2");
+    assert_eq!(d["message"]["id"], req["message"]);
+    assert_eq!(env.nq_ok(Some("rev1"), &["dequeue"]), "");
+    env.nb_ok("rev2", &["respond", &id, "accept", "--model", "m2"]);
+    assert_eq!(env.wait_terminal(1)["state"], "landed");
+    let msg = env.git(&env.golden(), &["log", "-1", "--format=%B", "master"]);
+    assert!(msg.contains("Reviewed-by: llm [rev2, m2]"), "{msg}");
+    // Answering again, or after the land finished, is refused.
+    assert!(!env.nb("rev1", &["respond", &id, "accept", "--model", "m"]).status.success());
+}
+
+#[test]
+fn reviewer_errors_when_the_review_policy_is_missing() {
+    let env = Env::new();
+    env.start_nqueue();
+    env.set_repo_config(
+        "review_policy = \"nope\"\n[[reviewer]]\nname = \"llm\"\nstage = \"pre-queue\"\ncommand = \"nbranch review-agent --nick rev\"\n",
+    );
+    env.commit("alice", "a.txt", "a\n", "Add a");
+    let (code, t) = env.land_wait("alice");
+    assert_eq!(code, 2);
+    assert_eq!(t["state"], "reviewer-error");
+    let err = reviews(&t)[0]["error"].as_str().unwrap();
+    assert!(err.contains("[policies.nope]"), "{err}");
 }
 
 #[test]

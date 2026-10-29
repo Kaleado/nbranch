@@ -2,11 +2,11 @@ use crate::util;
 use anyhow::{bail, Context, Result};
 use std::process::{Command, Stdio};
 
-/// The calling agent's nick: `NBRANCH_AGENT`, else nchat's nick for this
-/// session (`NCHAT_NICK`, or `nchat nick`).
+/// The calling agent's nick: `NBRANCH_AGENT`, else the session's nqueue agent
+/// ID (`NQUEUE_ID`), else nchat's nick for it (`NCHAT_NICK`, or `nchat nick`).
 pub fn resolve() -> Result<String> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-    let nick = match env("NBRANCH_AGENT").or_else(|| env("NCHAT_NICK")) {
+    let nick = match env("NBRANCH_AGENT").or_else(|| env("NQUEUE_ID")).or_else(|| env("NCHAT_NICK")) {
         Some(n) => n.trim().to_string(),
         None => from_nchat()?,
     };

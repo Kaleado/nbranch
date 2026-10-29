@@ -4,6 +4,7 @@ mod git;
 mod identity;
 mod land;
 mod notify;
+mod nq;
 mod paths;
 mod report;
 mod review;
@@ -96,11 +97,15 @@ enum Cmd {
     Tui,
     /// Show your nick and worktree
     Whoami,
-    /// Reviewer command: ask a review agent to review and wait for its verdict
+    /// Reviewer command: queue a request for a review agent and wait for its verdict
     ReviewAgent {
-        /// The review agent's nick
+        /// A review agent to ask (its own queue, nbranch.review.<nick>)
+        #[arg(long, conflicts_with = "queue")]
+        nick: Option<String>,
+        /// A queue any subscribed review agent can take the request from
+        /// (default nbranch.review)
         #[arg(long)]
-        nick: String,
+        queue: Option<String>,
     },
     /// Answer a review request (run by the review agent)
     Respond {
@@ -249,7 +254,7 @@ fn run() -> Result<i32> {
                 println!("no worktree yet; run `nbranch new`");
             }
         }
-        Cmd::ReviewAgent { nick } => return review_agent::run(&root, &nick),
+        Cmd::ReviewAgent { nick, queue } => return review_agent::run(&root, nick.as_deref(), queue.as_deref()),
         Cmd::Respond { request, verdict, comments, model } => {
             review_agent::respond(&root, &request, matches!(verdict, VerdictArg::Accept), &comments, model)?;
         }

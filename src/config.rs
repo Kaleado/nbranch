@@ -12,6 +12,7 @@ pub struct ConfigFile {
     pub notify_command: Option<String>,
     pub notify_as: Option<String>,
     pub setup_command: Option<String>,
+    pub review_policy: Option<String>,
     #[serde(default, rename = "reviewer")]
     pub reviewers: Vec<ReviewerFile>,
 }
@@ -64,6 +65,8 @@ pub struct Config {
     pub notify: Notify,
     /// Run in every worktree nbranch creates, e.g. to link untracked assets.
     pub setup: Option<String>,
+    /// The nqueue policy review queues are created with.
+    pub review_policy: String,
     pub reviewers: Vec<Reviewer>,
 }
 
@@ -116,6 +119,7 @@ impl Config {
             merged.notify_command = layer.notify_command.or(merged.notify_command);
             merged.notify_as = layer.notify_as.or(merged.notify_as);
             merged.setup_command = layer.setup_command.or(merged.setup_command);
+            merged.review_policy = layer.review_policy.or(merged.review_policy);
             merged.reviewers.extend(layer.reviewers);
         }
         let reviewer_timeout = parse_duration(merged.reviewer_timeout.as_deref().unwrap_or("15m"))?;
@@ -126,6 +130,7 @@ impl Config {
             None => Notify::Nchat { as_nick: merged.notify_as.unwrap_or_else(|| "nbranch".into()) },
         };
         let setup = merged.setup_command.filter(|c| !c.trim().is_empty());
+        let review_policy = merged.review_policy.unwrap_or_else(|| "nbranch-review".into());
         let mut reviewers: Vec<Reviewer> = Vec::new();
         for r in merged.reviewers {
             if r.name.trim().is_empty() {
@@ -140,7 +145,7 @@ impl Config {
             };
             reviewers.push(Reviewer { name: r.name, stage: r.stage, command: r.command, timeout });
         }
-        Ok(Config { gc_idle, notify, setup, reviewers })
+        Ok(Config { gc_idle, notify, setup, review_policy, reviewers })
     }
 
     pub fn stage(&self, stage: Stage) -> Vec<&Reviewer> {

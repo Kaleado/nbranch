@@ -16,7 +16,7 @@
 cargo install --path .
 nbranch init ~/work/myproj --from git@example.com:me/myproj.git --trunk master
 cd ~/work/myproj
-NBRANCH_AGENT=alice nbranch new        # agents normally get their nick from nchat
+NBRANCH_AGENT=alice nbranch new        # agents normally get their nick from nqueue
 cd agents/alice && ...edit, commit...
 nbranch land                           # result arrives as an nchat message
 nbranch tui                            # watch the queue and the trunk
@@ -56,9 +56,11 @@ nbranch tui                            # watch the queue and the trunk
 
 ### Agent identity
 
-- An agent's nbranch identity is its nchat nick, so that land results can be
-  delivered to the same session over the same channel nchat uses
-- It's resolved from `NBRANCH_AGENT`, then `NCHAT_NICK`, then `nchat nick`
+- An agent's nbranch identity is its session's nqueue agent ID (which is also
+  its nchat nick), so that land results and review requests reach the same
+  session
+- It's resolved from `NBRANCH_AGENT`, then `NQUEUE_ID`, then `NCHAT_NICK`, then
+  `nchat nick`
 - Worktrees and branches are named after the nick (`agents/<nick>`,
   `nbranch/<nick>`)
 
@@ -78,7 +80,7 @@ nbranch tui                            # watch the queue and the trunk
 | `nbranch gc [--idle D] [--force] [--dry-run]` | Remove worktrees that are idle (default `gc_idle`), clean and fully landed. `--force` also removes ones with unlanded commits. Also cleans up leftover temporary worktrees |
 | `nbranch tui` | [Live view](#tui) of the queue, the trunk and recent results |
 | `nbranch whoami` | Show the caller's nick and worktree |
-| `nbranch review-agent --nick <nick>` | Reviewer command that asks a review agent to review (see [Review agent](#review-agent)) |
+| `nbranch review-agent [--nick <nick> \| --queue <queue>]` | Reviewer command that queues a review request for a review agent (see [Review agent](#review-agent)) |
 | `nbranch requests [--json]` | List review requests waiting for the caller |
 | `nbranch respond <request> accept\|reject [--comment C]... [--model M]` | Answer a review request |
 
@@ -256,6 +258,7 @@ gc_idle = "24h"              # how long a worktree must be idle before gc remove
 notify_as = "nbranch"        # nchat nick notifications are sent from
 # notify_command = "..."     # replace nchat; "" disables notifications
 # setup_command = "..."      # run in every new worktree (see below)
+review_policy = "nbranch-review"  # nqueue policy review queues are created with
 
 [[reviewer]]
 name = "review-agent"
@@ -284,36 +287,59 @@ links to `<root>/golden.git/info/exclude`, which applies to every worktree.
 
 ### Notifications
 
-- Land results and review requests are sent as nchat direct messages
-  (`nchat msg <nick> <text>`, as the `notify_as` nick). The nchat Claude plugin
-  injects them into the agent's running session, so agents don't poll
+- Land results are sent as nchat direct messages (`nchat msg <nick> <text>`,
+  as the `notify_as` nick), which reach the agent's running session, so agents
+  don't poll
 - `notify_command` replaces nchat with any shell command. It receives
-  `NBRANCH_TO`, `NBRANCH_MESSAGE`, `NBRANCH_EVENT` (`land-result` or
-  `review-request`), `NBRANCH_TICKET`, and `NBRANCH_STATE` or
-  `NBRANCH_REQUEST`
+  `NBRANCH_TO`, `NBRANCH_MESSAGE`, `NBRANCH_EVENT` (`land-result`),
+  `NBRANCH_TICKET` and `NBRANCH_STATE`
+- Review requests go over [nqueue](#review-agent) instead
 - `nbranch land --wait` prints the result instead of sending a notification
 - A rejection notification includes the reviewers' comments, so the agent can
   usually act without running `nbranch show`
 
 ### Review agent
 
-`nbranch review-agent --nick <nick>` is the standard reviewer for LLM review:
+`nbranch review-agent` is the standard reviewer for LLM review. Requests travel
+over [nqueue](../nqueue) review queues, so they're leased to one review agent at
+a time and survive a review agent going away:
 
-1. It writes a review request and messages the review agent `<nick>` with the
-   request ID, the checkout path and how to answer
-2. The review agent reviews the checkout (read-only by convention) and runs
+1. It writes a review request and enqueues it, from the nqueue agent `nbranch`,
+   on a review queue:
+   - `--nick <nick>` - the queue `nbranch.review.<nick>`, which `<nick>` is
+     subscribed to, so only that agent reviews
+   - `--queue <queue>` - a shared queue (default `nbranch.review`). Any agent
+     subscribed to it (`nqueue subscribe <queue>`) may take the request; with
+     several, each request goes to one of them
+2. The nqueue plugin or extension delivers the request to a review agent, which
+   reviews the checkout (read-only by convention) and runs
    `nbranch respond <request> accept` or
    `nbranch respond <request> reject --comment 'path:line: error: text'`, with
-   `--model <model id>` or `NBRANCH_MODEL` set. `nbranch requests` lists its
-   pending requests
+   `--model <model id>` or `NBRANCH_MODEL` set. Responding acks the message.
+   If the review agent never answers, the lease expires and the request is
+   delivered again (to another subscriber of a shared queue).
+   `nbranch requests` lists requests waiting for the caller
 3. `review-agent` prints the verdict as reviewer JSON (including the review
    agent's nick and model, which end up in the `Reviewed-by` trailer) and exits
    0 or 1
 
-The review agent must be a separate session from the lander: `review-agent`
-fails with a reviewer error if `<nick>` is the lander, and `respond` only
-accepts answers from the addressed nick. The reviewer timeout bounds how long
-it waits.
+The review agent must be a separate session from the lander: `review-agent
+--nick` fails with a reviewer error if `<nick>` is the lander, `respond` only
+accepts answers from the addressed nick, and nobody may answer a request for
+their own land (they `nqueue nack` it so another reviewer gets it). The
+reviewer timeout bounds how long it waits.
+
+Review queues are created on first use with the nqueue policy named by
+`review_policy` (default `nbranch-review`), which must be defined in the nqueue
+home config, `~/.nqueue/config.toml`:
+
+```toml
+[policies.nbranch-review]
+mode = "compete"            # each request goes to one reviewer
+delivery = "at-least-once"  # leased until `nbranch respond` acks it
+lease-secs = 3600           # at least as long as a review may take
+max-in-flight = 1           # one review per reviewer at a time
+```
 
 ### Agent skill
 
@@ -325,7 +351,7 @@ it waits.
 - Land with `nbranch land` and wait for the notification instead of polling
 - Run `nbranch reset` after a successful land, and `nbranch sync` after a
   conflict
-- Answer review requests with `nbranch respond`
+- Answer review requests (delivered as nqueue messages) with `nbranch respond`
 
 ## Development
 
@@ -334,4 +360,6 @@ cargo test     # unit tests plus end-to-end tests in tests/cli.rs
 ```
 
 The end-to-end tests drive the real binary against throwaway repositories and
-use `notify_command` to capture notifications instead of nchat.
+use `notify_command` to capture notifications instead of nchat. Review agent
+tests start a private nqueue server, so they need `nqueue` (or `NQUEUE_BIN`)
+and `valkey-server` installed.

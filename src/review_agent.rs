@@ -1,10 +1,10 @@
-//! The standard reviewer that hands a land to an LLM review agent over the
-//! notification channel and waits for its verdict.
+//! The standard reviewer that hands a land to an LLM review agent over an
+//! nqueue review queue and waits for its verdict.
 
 use crate::config::Config;
 use crate::paths::Root;
 use crate::ticket::{Comment, ReviewerId, Severity, Store};
-use crate::{git, identity, notify, util};
+use crate::{git, identity, nq, util};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -16,7 +16,15 @@ pub struct Request {
     pub ticket: u64,
     pub stage: String,
     pub reviewer: String,
-    pub reviewer_nick: String,
+    /// The review agent the request is addressed to; any subscriber of the
+    /// queue may answer when this is unset.
+    #[serde(default)]
+    pub reviewer_nick: Option<String>,
+    #[serde(default)]
+    pub queue: String,
+    /// The request's nqueue message ID, acked when it's answered.
+    #[serde(default)]
+    pub message: Option<String>,
     pub agent: String,
     pub base: String,
     pub head: String,
@@ -39,9 +47,10 @@ fn response_path(root: &Root, id: &str) -> PathBuf {
     root.requests_dir().join(format!("{id}.response"))
 }
 
-/// Run as a reviewer command: ask `nick` to review and wait for its response.
+/// Run as a reviewer command: put a review request on a queue (`nick`'s own,
+/// `queue`, or the default one) and wait for a review agent to answer it.
 /// The reviewer timeout in the config bounds the wait.
-pub fn run(root: &Root, nick: &str) -> Result<i32> {
+pub fn run(root: &Root, nick: Option<&str>, queue: Option<&str>) -> Result<i32> {
     let var = |k: &str| std::env::var(k).with_context(|| format!("{k} is not set; review-agent must run as an nbranch reviewer"));
     let ticket: u64 = var("NBRANCH_TICKET")?.parse()?;
     let stage = var("NBRANCH_STAGE")?;
@@ -49,40 +58,47 @@ pub fn run(root: &Root, nick: &str) -> Result<i32> {
     let head = var("NBRANCH_HEAD")?;
     let agent = var("NBRANCH_AGENT")?;
     let reviewer = var("NBRANCH_REVIEWER").unwrap_or_else(|_| "review-agent".into());
-    if !util::valid_nick(nick) {
-        bail!("invalid reviewer nick '{nick}'");
+    if let Some(nick) = nick {
+        if !util::valid_nick(nick) {
+            bail!("invalid reviewer nick '{nick}'");
+        }
+        if nick == agent {
+            bail!("the review agent ({nick}) must be a different session from the lander");
+        }
     }
-    if nick == agent {
-        bail!("the review agent ({nick}) must be a different session from the lander");
-    }
+    let queue = match (nick, queue) {
+        (Some(n), _) => nq::agent_queue(n),
+        (None, Some(q)) => q.to_string(),
+        (None, None) => nq::DEFAULT_QUEUE.to_string(),
+    };
 
-    let id = format!("{ticket}-{stage}-{nick}");
+    let id = format!("{ticket}-{stage}-{}", util::sanitize(nick.unwrap_or(&reviewer)));
     std::fs::create_dir_all(root.requests_dir())?;
     let _ = std::fs::remove_file(response_path(root, &id));
-    let req = Request {
+    let mut req = Request {
         id: id.clone(),
         ticket,
         stage,
         reviewer,
-        reviewer_nick: nick.into(),
+        reviewer_nick: nick.map(String::from),
+        queue: queue.clone(),
+        message: None,
         agent,
         base,
         head,
         worktree: std::env::current_dir()?,
         created: util::now(),
     };
+    // Written before it's queued, so whoever takes it can find it.
     util::write_atomic(&request_path(root, &id), &serde_json::to_vec_pretty(&req)?)?;
 
     let trunk = root.trunk()?;
     let cfg = Config::load(root, &trunk)?;
     let commits = git::run(&root.golden(), &["rev-list", "--count", &format!("{}..{}", req.base, req.head)])?;
-    let extra = [
-        ("NBRANCH_EVENT", "review-request".to_string()),
-        ("NBRANCH_TICKET", ticket.to_string()),
-        ("NBRANCH_REQUEST", id.clone()),
-    ];
-    notify::send(&cfg.notify, nick, &request_message(&req, &commits), &extra)?;
-    eprintln!("waiting for {nick} to respond to review request {id}");
+    let message = nq::send_request(&queue, &cfg.review_policy, nick, &request_message(&req, &commits))?;
+    req.message = Some(message.clone());
+    util::write_atomic(&request_path(root, &id), &serde_json::to_vec_pretty(&req)?)?;
+    eprintln!("queued review request {id} on {queue} as {message}; waiting for a response");
 
     loop {
         if let Ok(data) = std::fs::read(response_path(root, &id)) {
@@ -102,7 +118,8 @@ fn request_message(req: &Request, commits: &str) -> String {
          It is checked out at {wt} (don't modify it); see the change with `git -C {wt} diff {base} {head}`. \
          When you're done, run `nbranch respond {id} accept` or \
          `nbranch respond {id} reject --comment 'path:line: error: what is wrong'` (repeat --comment as needed), \
-         passing --model <your model id> or setting NBRANCH_MODEL.",
+         passing --model <your model id> or setting NBRANCH_MODEL. Responding acks this message. \
+         If you are {agent}, don't review your own land: `nqueue nack` this message so another reviewer gets it.",
         id = req.id,
         ticket = req.ticket,
         agent = req.agent,
@@ -112,15 +129,37 @@ fn request_message(req: &Request, commits: &str) -> String {
     )
 }
 
+/// Ack the request's message for `nick`. Only the agent holding its lease can;
+/// for anyone else (e.g. answering from another shell) the lease just expires.
+fn ack(req: &Request, nick: &str) {
+    if let Some(message) = &req.message {
+        if let Err(e) = nq::ack(nick, message) {
+            eprintln!("note: could not ack {message}: {e:#}");
+        }
+    }
+}
+
 /// Record a review agent's verdict for a pending request.
 pub fn respond(root: &Root, id: &str, accept: bool, comments: &[String], model: Option<String>) -> Result<()> {
     let nick = identity::resolve()?;
     let data = std::fs::read(request_path(root, id)).with_context(|| format!("no pending review request {id}"))?;
     let req: Request = serde_json::from_slice(&data)?;
-    if req.reviewer_nick != nick {
-        bail!("request {id} is addressed to {}, but you are {nick}", req.reviewer_nick);
+    if let Some(addressed) = &req.reviewer_nick {
+        if *addressed != nick {
+            bail!("request {id} is addressed to {addressed}, but you are {nick}");
+        }
+    }
+    if req.agent == nick {
+        bail!("you landed #{}, so someone else must review it; `nqueue nack` its message to hand it on", req.ticket);
+    }
+    let state = Store::new(root).load(req.ticket).map(|t| t.state).ok();
+    if !state.is_some_and(|s| !s.is_terminal()) {
+        ack(&req, &nick);
+        let _ = std::fs::remove_file(request_path(root, id));
+        bail!("land #{} has already finished, so request {id} needs no answer", req.ticket);
     }
     if response_path(root, id).exists() {
+        ack(&req, &nick);
         bail!("request {id} already has a response");
     }
     let model = model
@@ -131,13 +170,15 @@ pub fn respond(root: &Root, id: &str, accept: bool, comments: &[String], model: 
     if !accept && comments.is_empty() {
         bail!("a rejection needs at least one --comment");
     }
-    let resp = Response { accept, reviewer: ReviewerId { nick, model: Some(model) }, comments };
+    let resp = Response { accept, reviewer: ReviewerId { nick: nick.clone(), model: Some(model) }, comments };
     util::write_atomic(&response_path(root, id), &serde_json::to_vec_pretty(&resp)?)?;
+    ack(&req, &nick);
     println!("Recorded {} for land #{}.", if accept { "acceptance" } else { "rejection" }, req.ticket);
     Ok(())
 }
 
-/// Pending requests addressed to `nick` for lands that are still running.
+/// Pending requests `nick` may answer, for lands that are still running:
+/// those addressed to it, and those on shared queues for others' lands.
 pub fn pending(root: &Root, nick: &str) -> Result<Vec<Request>> {
     let store = Store::new(root);
     let mut out = Vec::new();
@@ -152,7 +193,11 @@ pub fn pending(root: &Root, nick: &str) -> Result<Vec<Request>> {
             continue;
         };
         let live = store.load(req.ticket).map(|t| !t.state.is_terminal()).unwrap_or(false);
-        if req.reviewer_nick == nick && live && !response_path(root, &req.id).exists() {
+        let mine = match &req.reviewer_nick {
+            Some(n) => n == nick,
+            None => req.agent != nick,
+        };
+        if mine && live && !response_path(root, &req.id).exists() {
             out.push(req);
         }
     }

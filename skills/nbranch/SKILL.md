@@ -1,13 +1,14 @@
 ---
 name: nbranch
-description: Work on a shared repository through nbranch - your own worktree and branch, landing changes through a local merge queue with reviewers, and answering nbranch review requests. Use when the project is an nbranch root (it has golden.git/ and agents/), when told to land changes with nbranch, or when you receive an "nbranch:" or "nbranch review request" message.
+description: Work on a shared repository through nbranch - your own worktree and branch, landing changes through a local merge queue with reviewers, and answering nbranch review requests. Use when the project is an nbranch root (it has golden.git/ and agents/), when told to land changes with nbranch, or when you receive an "nbranch:" message or an "nbranch review request" (an nqueue message on an nbranch.review queue).
 ---
 
 # Working with nbranch
 
 nbranch gives each agent its own git worktree and branch, and lands changes onto
-the trunk through a queue that runs reviewers. Your identity is your nchat nick
-(override with `NBRANCH_AGENT`).
+the trunk through a queue that runs reviewers. Your identity is your nqueue
+agent ID, `NQUEUE_ID`, which is also your nchat nick (override with
+`NBRANCH_AGENT`).
 
 ## Rules
 
@@ -49,17 +50,23 @@ rejections with reviewer output), `nbranch cancel N`, `nbranch whoami`.
 
 ## Reviewing for others
 
-If you receive `nbranch review request <id>`:
+Review requests arrive as `[nqueue]` messages from `nbranch` on an
+`nbranch.review*` queue, starting `nbranch review request <id>`. The message is
+leased to you until you answer, so answer every one you take.
 
-1. Review the change at the path in the message, e.g.
+1. If it's a review of your own land, don't review it: run
+   `nqueue nack <message id>` so another reviewer gets it.
+2. Review the change at the path in the message, e.g.
    `git -C <path> diff <base> <head>`. Don't modify files there.
-2. Answer with your model id (or set `NBRANCH_MODEL`):
+3. Answer with your model id (or set `NBRANCH_MODEL`):
    - `nbranch respond <id> accept --model <model>`
    - `nbranch respond <id> reject --model <model> --comment 'src/x.rs:42: error: what is wrong and why'`
      (repeat `--comment`; forms: `path:line: severity: text`,
      `path: severity: text`, `severity: text` or plain text; severities are
      `error`, `warning` and `note`)
-3. Reject only for real problems, and make every comment actionable. The
+   Responding acks the nqueue message for you.
+4. Reject only for real problems, and make every comment actionable. The
    lander gets your comments verbatim.
 
-`nbranch requests` lists requests still waiting for you.
+`nbranch requests` lists requests still waiting for you. To review lands from
+a shared review queue, subscribe to it: `nqueue subscribe nbranch.review`.
