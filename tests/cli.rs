@@ -808,3 +808,218 @@ fn setup_command_runs_in_agent_and_review_worktrees() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("setup failed"), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stderr).contains("broken"));
 }
+
+// ---- clones on other machines, reached over (fake) SSH ----
+
+impl Env {
+    /// An `ssh` that runs the remote command here, from $HOME as a real
+    /// login would, logging each destination. git uses it too.
+    fn fake_ssh(&self) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = self.home().join("fakessh");
+        let ssh = dir.join("ssh");
+        if !ssh.exists() {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                &ssh,
+                format!(
+                    r#"#!/bin/sh
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --) shift; break ;;
+    -o|-p|-i|-l|-F|-J) shift 2 ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+echo "$1" >> '{log}'
+shift
+cd "$HOME" && exec sh -c "$*"
+"#,
+                    log = self.home().join("ssh.log").display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        ssh
+    }
+
+    /// The hub address of this env's root.
+    fn hub(&self) -> String {
+        format!("box:{}", self.root.display())
+    }
+
+    /// Run nbranch in `dir` (a clone, usually) with the fake ssh.
+    fn far(&self, dir: &Path, agent: &str, args: &[&str]) -> Output {
+        let mut cmd = Command::new(BIN);
+        cmd.args(args).current_dir(dir);
+        configure(&mut cmd, self.home());
+        cmd.env("NBRANCH_AGENT", agent).env("NBRANCH_SSH", self.fake_ssh());
+        cmd.output().unwrap()
+    }
+
+    fn far_ok(&self, dir: &Path, agent: &str, args: &[&str]) -> String {
+        check(&format!("nbranch {} (in {})", args.join(" "), dir.display()), &self.far(dir, agent, args))
+    }
+
+    /// `agent`'s clone of the hub, in `$HOME/far/<agent>`.
+    fn clone_as(&self, agent: &str) -> PathBuf {
+        let far = self.home().join("far");
+        std::fs::create_dir_all(&far).unwrap();
+        self.far_ok(&far, agent, &["clone", &self.hub(), agent]);
+        far.join(agent)
+    }
+
+    fn commit_in(&self, dir: &Path, file: &str, content: &str, msg: &str) {
+        std::fs::write(dir.join(file), content).unwrap();
+        self.git(dir, &["add", file]);
+        self.git(dir, &["commit", "-qm", msg]);
+    }
+}
+
+#[test]
+fn clone_lands_over_ssh_then_syncs_and_resets() {
+    let env = Env::new();
+    let clone = env.clone_as("remy");
+    assert_eq!(env.git(&clone, &["rev-parse", "--abbrev-ref", "HEAD"]), "nbranch/remy");
+    assert_eq!(env.git(&clone, &["config", "nbranch.root"]), env.root.canonicalize().unwrap().to_str().unwrap());
+    let whoami = env.far_ok(&clone, "remy", &["whoami"]);
+    assert!(whoami.contains("hub: box:"), "{whoami}");
+
+    env.commit_in(&clone, "far.txt", "from afar\n", "Add far");
+    let out = env.far(&clone, "remy", &["land", "--wait", "--json"]);
+    let t: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{t:#}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(t["state"], "landed");
+    assert_eq!(t["agent"], "remy");
+    assert_eq!(env.trunk_file("far.txt").as_deref(), Some("from afar\n"));
+    let msg = env.git(&env.golden(), &["log", "-1", "--format=%B", "master"]);
+    assert!(msg.contains("Nbranch-Agent: remy"), "{msg}");
+    assert!(std::fs::read_to_string(env.home().join("ssh.log")).unwrap().lines().all(|l| l == "box"));
+    // the hub made no worktree for a clone
+    assert!(!env.worktree("remy").exists());
+
+    // reset knows what landed, even though the landed commit is a cherry-pick
+    env.far_ok(&clone, "remy", &["reset"]);
+    assert_eq!(env.git(&clone, &["rev-parse", "HEAD"]), env.trunk());
+
+    // work that hasn't landed is protected
+    env.commit_in(&clone, "wip.txt", "wip\n", "WIP");
+    let out = env.far(&clone, "remy", &["reset"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("haven't landed"));
+
+    // the trunk moves; sync rebases onto it, and an async land notifies remy
+    env.human_commit("human.txt", "h\n", "Human change");
+    env.far_ok(&clone, "remy", &["sync"]);
+    assert_eq!(env.git(&clone, &["rev-parse", "HEAD~1"]), env.trunk());
+    let queued = env.far_ok(&clone, "remy", &["land"]);
+    assert!(queued.contains("Queued land #2"), "{queued}");
+    env.wait_notification("remy\t");
+    assert_eq!(env.wait_terminal(2)["state"], "landed");
+    // queue, show and log are answered by the hub
+    let shown: Value = serde_json::from_str(&env.far_ok(&clone, "remy", &["show", "2", "--json"])).unwrap();
+    assert_eq!(shown["state"], "landed");
+}
+
+#[test]
+fn clone_rejections_and_conflicts_come_back_through_ssh() {
+    let env = Env::new();
+    env.set_repo_config("[[reviewer]]\nname = \"no-bad\"\nstage = \"pre-queue\"\ncommand = \"if grep -rl bad --include=*.txt .; then exit 1; fi\"\n");
+    let clone = env.clone_as("remy");
+    env.commit_in(&clone, "x.txt", "bad\n", "Bad");
+    let out = env.far(&clone, "remy", &["land", "--wait"]);
+    assert_eq!(out.status.code(), Some(1), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("rejected"), "{}", String::from_utf8_lossy(&out.stdout));
+    // a rewritten branch is pushed over the old one
+    env.git(&clone, &["reset", "-q", "--hard", "HEAD~1"]);
+    env.commit_in(&clone, "x.txt", "good\n", "Good");
+    let out = env.far(&clone, "remy", &["land", "--wait"]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(env.trunk_file("x.txt").as_deref(), Some("good\n"));
+}
+
+#[test]
+fn clones_belong_to_one_agent() {
+    let env = Env::new();
+    // an agent with a worktree on the hub works there
+    env.nb_ok("alice", &["new"]);
+    let far = env.home().join("far");
+    std::fs::create_dir_all(&far).unwrap();
+    let out = env.far(&far, "alice", &["clone", &env.hub(), "alice"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("already has a worktree"), "{out:?}");
+
+    let clone = env.clone_as("remy");
+    let out = env.far(&clone, "mallory", &["land"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("belongs to remy"), "{out:?}");
+    assert!(!env.far(&far, "remy", &["clone", &env.hub(), "remy"]).status.success(), "cloned into a non-empty dir");
+    assert!(!env.far(&far, "x", &["clone", "no-colon", "y"]).status.success());
+
+    // a nested relative destination lands where it says
+    env.far_ok(env.home(), "nested", &["clone", &env.hub(), "far/deep/nested"]);
+    assert!(env.home().join("far/deep/nested/README").exists());
+
+    // a clone of a branch that already has work picks it up
+    env.commit_in(&clone, "r.txt", "r\n", "Remy's work");
+    env.far_ok(&clone, "remy", &["land", "--json"]);
+    env.wait_terminal(1);
+    std::fs::remove_dir_all(&clone).unwrap();
+    let again = env.clone_as("remy");
+    assert_eq!(env.git(&again, &["log", "-1", "--format=%s"]), "Remy's work");
+}
+
+#[test]
+fn review_agent_in_a_clone() {
+    let env = Env::new();
+    env.start_nqueue();
+    env.set_repo_config(
+        "[[reviewer]]\nname = \"review-agent\"\nstage = \"in-queue\"\ncommand = \"nbranch review-agent --nick rev\"\ntimeout = \"60s\"\n",
+    );
+    let clone = env.clone_as("rev");
+    env.commit("alice", "a.txt", "a\n", "Add a");
+    env.nb_ok("alice", &["land"]);
+
+    // rev sees the request from its clone, and the message says how to check it out
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let id = loop {
+        let reqs: Value = serde_json::from_str(&env.far_ok(&clone, "rev", &["requests", "--json"])).unwrap();
+        if let Some(r) = reqs.as_array().unwrap().iter().find(|r| r["message"].is_string()) {
+            break r["id"].as_str().unwrap().to_string();
+        }
+        assert!(Instant::now() < deadline, "no review request reached rev");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let d = env.dequeue("rev");
+    assert!(d["message"]["body"].as_str().unwrap().contains(&format!("nbranch review-checkout {id}")));
+    let review_ref = format!("refs/nbranch/reviews/{id}");
+    env.git(&env.golden(), &["rev-parse", "--verify", &review_ref]);
+
+    // the in-queue result is on no branch, but the review ref brings it over
+    let wt = PathBuf::from(env.far_ok(&clone, "rev", &["review-checkout", &id]).trim());
+    assert_eq!(std::fs::read_to_string(wt.join("a.txt")).unwrap(), "a\n");
+    assert!(wt.starts_with(clone.join(".git")));
+
+    let mut cmd = Command::new(BIN);
+    cmd.args(["respond", &id, "accept", "--comment", "note: tidy"]).current_dir(&clone);
+    configure(&mut cmd, env.home());
+    cmd.env("NBRANCH_AGENT", "rev").env("NBRANCH_SSH", env.fake_ssh()).env("NBRANCH_MODEL", "far-model");
+    check("respond from a clone", &cmd.output().unwrap());
+    assert_eq!(env.wait_terminal(1)["state"], "landed");
+    let msg = env.git(&env.golden(), &["log", "-1", "--format=%B", "master"]);
+    assert!(msg.contains("Reviewed-by: review-agent [rev, far-model]"), "{msg}");
+    // the review ref goes with the request; respond acked the lease on the hub's nqueue
+    let refs = env.git(&env.golden(), &["for-each-ref", "refs/nbranch/reviews/"]);
+    assert!(refs.is_empty(), "{refs}");
+    let again = env.nq(Some("rev"), &["ack", d["message"]["id"].as_str().unwrap()]);
+    assert!(String::from_utf8_lossy(&again.stderr).contains("not leased"), "{again:?}");
+}
+
+#[test]
+fn gc_prunes_review_refs_whose_request_is_gone() {
+    let env = Env::new();
+    let head = env.trunk();
+    env.git(&env.golden(), &["update-ref", "refs/nbranch/reviews/9-pre-queue-x", &head]);
+    env.nb_ok("anyone", &["gc"]);
+    assert!(env.git(&env.golden(), &["for-each-ref", "refs/nbranch/reviews/"]).is_empty());
+}

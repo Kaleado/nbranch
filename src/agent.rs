@@ -43,14 +43,22 @@ pub fn new(root: &Root, nick: &str) -> Result<(PathBuf, bool)> {
 /// Run `setup_command` in a worktree nbranch just created. `kind` is `agent`
 /// or `review`.
 pub fn run_setup(cfg: &Config, root: &Root, wt: &Path, kind: &str) -> Result<()> {
-    let Some(setup) = &cfg.setup else { return Ok(()) };
+    match &cfg.setup {
+        Some(setup) => run_setup_command(setup, &root.dir, wt, kind),
+        None => Ok(()),
+    }
+}
+
+/// Run a setup command in `wt`. `kind` is `agent`, `review` or `clone`;
+/// `root` is the nbranch root, or the clone itself.
+pub fn run_setup_command(setup: &str, root: &Path, wt: &Path, kind: &str) -> Result<()> {
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg(setup)
         .current_dir(wt)
         .env("NBRANCH_WORKTREE", wt)
         .env("NBRANCH_WORKTREE_KIND", kind)
-        .env("NBRANCH_ROOT", &root.dir)
+        .env("NBRANCH_ROOT", root)
         .stdin(Stdio::null());
     for var in git::GIT_ENV {
         cmd.env_remove(var);
@@ -76,16 +84,23 @@ fn rebase_in_progress(wt: &Path) -> bool {
 pub fn sync(root: &Root, nick: &str) -> Result<i32> {
     let wt = worktree(root, nick)?;
     let trunk = root.trunk()?;
+    sync_in(&wt, &format!("refs/heads/{trunk}"), &trunk, &branch_name(nick))
+}
+
+/// Rebase the branch checked out in `wt` onto `trunk_ref` (the trunk,
+/// `trunk`, as `wt` sees it).
+pub fn sync_in(wt: &Path, trunk_ref: &str, trunk: &str, branch: &str) -> Result<i32> {
+    let wt = wt.to_path_buf();
     if rebase_in_progress(&wt) {
         bail!("a rebase is already in progress in {}; finish it with `git rebase --continue` or `git rebase --abort`", wt.display());
     }
     if git::is_dirty(&wt)? {
         bail!("commit or stash your changes in {} before syncing", wt.display());
     }
-    let out = git::output(&wt, &["rebase", &format!("refs/heads/{trunk}")])?;
+    let out = git::output(&wt, &["rebase", trunk_ref])?;
     if out.status.success() {
         let head = git::rev_parse(&wt, "HEAD")?;
-        println!("Rebased {} onto {trunk}; now at {}.", branch_name(nick), git::short(&head));
+        println!("Rebased {branch} onto {trunk}; now at {}.", git::short(&head));
         return Ok(0);
     }
     print!("{}", String::from_utf8_lossy(&out.stdout));
@@ -100,19 +115,29 @@ pub fn sync(root: &Root, nick: &str) -> Result<i32> {
 
 /// Commits on the agent's branch that haven't reached the trunk, as "sha subject".
 pub fn unlanded(root: &Root, nick: &str, wt: &Path, trunk: &str) -> Result<Vec<String>> {
-    let cherry = git::run(wt, &["cherry", &format!("refs/heads/{trunk}"), "HEAD"])?;
+    unlanded_in(wt, &format!("refs/heads/{trunk}"), &landed_heads(root, nick)?)
+}
+
+/// The snapshots of `nick`'s lands that reached the trunk.
+pub fn landed_heads(root: &Root, nick: &str) -> Result<Vec<String>> {
+    Ok(Store::new(root)
+        .all()?
+        .into_iter()
+        .filter(|t| t.agent == nick && t.state == State::Landed)
+        .map(|t| t.head)
+        .collect())
+}
+
+/// Commits in `wt`'s HEAD that haven't reached `trunk_ref`, as "sha subject".
+/// A landed snapshot that `wt` doesn't have counts as not containing them.
+pub fn unlanded_in(wt: &Path, trunk_ref: &str, landed_heads: &[String]) -> Result<Vec<String>> {
+    let cherry = git::run(wt, &["cherry", trunk_ref, "HEAD"])?;
     let candidates: Vec<&str> = cherry.lines().filter_map(|l| l.strip_prefix("+ ")).collect();
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
     // Patch ids change when a pick had to merge around nearby edits, so also
     // count anything contained in one of this agent's landed snapshots.
-    let landed_heads: Vec<String> = Store::new(root)
-        .all()?
-        .into_iter()
-        .filter(|t| t.agent == nick && t.state == State::Landed)
-        .map(|t| t.head)
-        .collect();
     let mut out = Vec::new();
     for c in candidates {
         let landed = landed_heads.iter().any(|h| {
@@ -131,6 +156,13 @@ pub fn unlanded(root: &Root, nick: &str, wt: &Path, trunk: &str) -> Result<Vec<S
 pub fn reset(root: &Root, nick: &str, force: bool) -> Result<()> {
     let wt = worktree(root, nick)?;
     let trunk = root.trunk()?;
+    let landed = if force { Vec::new() } else { landed_heads(root, nick)? };
+    reset_in(&wt, &format!("refs/heads/{trunk}"), &trunk, &branch_name(nick), &landed, force)
+}
+
+/// Move the branch checked out in `wt` to `trunk_ref`.
+pub fn reset_in(wt: &Path, trunk_ref: &str, trunk: &str, branch: &str, landed_heads: &[String], force: bool) -> Result<()> {
+    let wt = wt.to_path_buf();
     if rebase_in_progress(&wt) {
         bail!("a rebase is in progress in {}; finish or abort it first", wt.display());
     }
@@ -138,7 +170,7 @@ pub fn reset(root: &Root, nick: &str, force: bool) -> Result<()> {
         if git::is_dirty(&wt)? {
             bail!("uncommitted changes in {}; commit and land them, or use --force to discard them", wt.display());
         }
-        let pending = unlanded(root, nick, &wt, &trunk)?;
+        let pending = unlanded_in(&wt, trunk_ref, landed_heads)?;
         if !pending.is_empty() {
             bail!(
                 "{} commit(s) haven't landed on {trunk} yet:\n  {}\nLand them first, or use --force to discard them",
@@ -147,9 +179,9 @@ pub fn reset(root: &Root, nick: &str, force: bool) -> Result<()> {
             );
         }
     }
-    git::run(&wt, &["reset", "--quiet", "--hard", &format!("refs/heads/{trunk}")])?;
+    git::run(&wt, &["reset", "--quiet", "--hard", trunk_ref])?;
     let head = git::rev_parse(&wt, "HEAD")?;
-    println!("Reset {} to {trunk} at {}.", branch_name(nick), git::short(&head));
+    println!("Reset {branch} to {trunk} at {}.", git::short(&head));
     Ok(())
 }
 
@@ -235,6 +267,7 @@ pub fn gc(root: &Root, idle: Option<Duration>, force: bool, dry_run: bool) -> Re
     }
     if !dry_run {
         git::run(&golden, &["worktree", "prune"])?;
+        crate::review_agent::prune_review_refs(root)?;
     }
     Ok(())
 }

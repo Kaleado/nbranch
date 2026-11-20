@@ -6,6 +6,7 @@ mod land;
 mod notify;
 mod nq;
 mod paths;
+mod remote;
 mod report;
 mod review;
 mod review_agent;
@@ -43,6 +44,19 @@ enum Cmd {
     },
     /// Create your worktree and branch at the trunk HEAD
     New,
+    /// Clone an nbranch root on another machine over SSH, to work and land
+    /// from here
+    Clone {
+        /// The hub: host:/path/to/root (host as for ssh; a relative path is
+        /// relative to your home directory there)
+        hub: String,
+        /// Where to put the clone (default: the root's directory name)
+        dir: Option<PathBuf>,
+        /// The nbranch command on the hub, e.g. ~/.cargo/bin/nbranch if it
+        /// isn't on PATH for non-interactive SSH sessions
+        #[arg(long, default_value = "nbranch")]
+        hub_command: String,
+    },
     /// Submit your branch to be landed on the trunk
     Land {
         /// Block until the land finishes instead of being notified
@@ -123,6 +137,13 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Check out the change a review request is about (in a clone, fetched
+    /// from the hub) and print where
+    ReviewCheckout { request: String },
+    #[command(name = "__hub-info", hide = true)]
+    HubInfo,
+    #[command(name = "__landed-heads", hide = true)]
+    LandedHeads,
     #[command(name = "__worker", hide = true)]
     Worker { ticket: u64 },
 }
@@ -157,10 +178,30 @@ fn run() -> Result<i32> {
         println!("Agents start with `nbranch new`; add reviewers in .nbranch on the trunk.");
         return Ok(0);
     }
-    let root = Root::discover(cli.root)?;
+    if let Cmd::Clone { hub, dir, hub_command } = &cli.command {
+        let addr: remote::HubAddr = hub.parse()?;
+        let dir = dir.clone().unwrap_or_else(|| {
+            PathBuf::from(addr.root.trim_end_matches('/').rsplit('/').next().unwrap_or("nbranch"))
+        });
+        let nick = identity::resolve()?;
+        let c = remote::clone(&addr, &dir, hub_command, &nick)?;
+        println!("Cloned {}:{} into {} on branch {}.", c.hub.dest, c.hub.root, c.dir.display(), c.branch());
+        println!("Work and commit there, then `nbranch land`; results arrive over nchat as usual.");
+        return Ok(0);
+    }
+    let root = match cli.root {
+        Some(dir) => Root::discover(Some(dir))?,
+        None => match Root::discover(None) {
+            Ok(root) => root,
+            Err(e) => match remote::Clone::discover()? {
+                Some(c) => return in_clone(&c, cli.command),
+                None => return Err(e),
+            },
+        },
+    };
     let store = Store::new(&root);
     match cli.command {
-        Cmd::Init { .. } => unreachable!(),
+        Cmd::Init { .. } | Cmd::Clone { .. } => unreachable!(),
         Cmd::New => {
             let nick = identity::resolve()?;
             let (path, created) = agent::new(&root, &nick)?;
@@ -254,6 +295,27 @@ fn run() -> Result<i32> {
                 println!("no worktree yet; run `nbranch new`");
             }
         }
+        Cmd::ReviewCheckout { request } => {
+            let nick = identity::resolve()?;
+            let req = review_agent::pending(&root, &nick)?
+                .into_iter()
+                .find(|r| r.id == request)
+                .ok_or_else(|| anyhow::anyhow!("no review request {request} waiting for {nick}"))?;
+            println!("{}", req.worktree.display());
+            eprintln!("See the change with `git -C {} diff {} {}`.", req.worktree.display(), req.base, req.head);
+        }
+        Cmd::HubInfo => {
+            let nick = identity::resolve()?;
+            let trunk = root.trunk()?;
+            let branch = format!("refs/heads/{}", agent::branch_name(&nick));
+            print_json(&remote::HubInfo {
+                root: root.dir.clone(),
+                trunk,
+                has_worktree: root.agent_worktree(&nick).join(".git").exists(),
+                has_branch: git::try_rev_parse(&root.golden(), &branch).is_some(),
+            })?;
+        }
+        Cmd::LandedHeads => print_json(&agent::landed_heads(&root, &identity::resolve()?)?)?,
         Cmd::ReviewAgent { nick, queue } => return review_agent::run(&root, nick.as_deref(), queue.as_deref()),
         Cmd::Respond { request, verdict, comments, model } => {
             review_agent::respond(&root, &request, matches!(verdict, VerdictArg::Accept), &comments, model)?;
@@ -280,6 +342,75 @@ fn run() -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+/// Commands run in a clone on another machine: git work happens here, and
+/// everything about the queue happens on the hub over SSH.
+fn in_clone(c: &remote::Clone, command: Cmd) -> Result<i32> {
+    c.check_identity()?;
+    // the arguments after the program name, as given
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match command {
+        Cmd::New | Cmd::Whoami => {
+            println!("{}", c.nick);
+            println!("clone: {}", c.dir.display());
+            println!("branch: {}", c.branch());
+            println!("hub: {}:{}", c.hub.dest, c.hub.root);
+            Ok(0)
+        }
+        Cmd::Land { .. } => {
+            if git::is_dirty(&c.dir).unwrap_or(false) {
+                eprintln!("warning: uncommitted changes in {} are not part of this land", c.dir.display());
+            }
+            c.push_branch()?;
+            c.hub.forward(&c.nick, &args, false)
+        }
+        Cmd::Sync => {
+            c.fetch_trunk()?;
+            agent::sync_in(&c.dir, &c.trunk_ref(), &c.trunk, &c.branch())
+        }
+        Cmd::Reset { force } => {
+            c.fetch_trunk()?;
+            let landed = if force { Vec::new() } else { c.landed_heads()? };
+            agent::reset_in(&c.dir, &c.trunk_ref(), &c.trunk, &c.branch(), &landed, force)?;
+            Ok(0)
+        }
+        Cmd::Queue { .. } | Cmd::Show { .. } | Cmd::Log { .. } | Cmd::Cancel { .. } | Cmd::Requests { .. } => {
+            c.hub.forward(&c.nick, &args, false)
+        }
+        Cmd::Tui => c.hub.forward(&c.nick, &args, true),
+        Cmd::Respond { request, verdict, comments, model } => {
+            // NBRANCH_MODEL is set here, not on the hub
+            let mut fwd = vec!["respond".to_string(), request, args_verdict(verdict).into()];
+            for comment in comments {
+                fwd.push("--comment".into());
+                fwd.push(comment);
+            }
+            if let Some(m) = model {
+                fwd.push("--model".into());
+                fwd.push(m);
+            }
+            c.hub.forward(&c.nick, &fwd, false)
+        }
+        Cmd::ReviewCheckout { request } => {
+            let (wt, base, head) = remote::review_checkout(c, &request)?;
+            println!("{}", wt.display());
+            eprintln!("See the change with `git -C {} diff {base} {head}`.", wt.display());
+            Ok(0)
+        }
+        Cmd::Gc { .. } => anyhow::bail!("gc runs on the hub: ssh {} nbranch --root {} gc", c.hub.dest, c.hub.root),
+        Cmd::ReviewAgent { .. } | Cmd::Worker { .. } | Cmd::HubInfo | Cmd::LandedHeads => {
+            anyhow::bail!("this command runs on the hub, not in a clone")
+        }
+        Cmd::Init { .. } | Cmd::Clone { .. } => unreachable!(),
+    }
+}
+
+fn args_verdict(v: VerdictArg) -> &'static str {
+    match v {
+        VerdictArg::Accept => "accept",
+        VerdictArg::Reject => "reject",
+    }
 }
 
 fn land(root: &Root, wait: bool, json: bool) -> Result<i32> {

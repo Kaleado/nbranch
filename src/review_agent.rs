@@ -39,6 +39,26 @@ struct Response {
     comments: Vec<Comment>,
 }
 
+/// The ref in golden holding the commit under review, so a review agent on
+/// another machine can fetch it (the in-queue result is on no branch).
+pub fn review_ref(id: &str) -> String {
+    format!("refs/nbranch/reviews/{id}")
+}
+
+/// Remove review refs whose request has gone (answered, or its reviewer
+/// was killed by a timeout).
+pub fn prune_review_refs(root: &Root) -> Result<()> {
+    let golden = root.golden();
+    let refs = git::run(&golden, &["for-each-ref", "--format=%(refname)", "refs/nbranch/reviews/"])?;
+    for r in refs.lines() {
+        let id = r.trim_start_matches("refs/nbranch/reviews/");
+        if !request_path(root, id).exists() {
+            let _ = git::run(&golden, &["update-ref", "-d", r]);
+        }
+    }
+    Ok(())
+}
+
 fn request_path(root: &Root, id: &str) -> PathBuf {
     root.requests_dir().join(format!("{id}.json"))
 }
@@ -90,6 +110,7 @@ pub fn run(root: &Root, nick: Option<&str>, queue: Option<&str>) -> Result<i32> 
         created: util::now(),
     };
     // Written before it's queued, so whoever takes it can find it.
+    git::run(&root.golden(), &["update-ref", &review_ref(&id), &req.head])?;
     util::write_atomic(&request_path(root, &id), &serde_json::to_vec_pretty(&req)?)?;
 
     let trunk = root.trunk()?;
@@ -105,6 +126,7 @@ pub fn run(root: &Root, nick: Option<&str>, queue: Option<&str>) -> Result<i32> 
             let resp: Response = serde_json::from_slice(&data).context("parsing review response")?;
             let _ = std::fs::remove_file(request_path(root, &id));
             let _ = std::fs::remove_file(response_path(root, &id));
+            let _ = git::run(&root.golden(), &["update-ref", "-d", &review_ref(&id)]);
             println!("{}", serde_json::json!({ "reviewer": resp.reviewer, "comments": resp.comments }));
             return Ok(if resp.accept { 0 } else { 1 });
         }
@@ -116,6 +138,7 @@ fn request_message(req: &Request, commits: &str) -> String {
     format!(
         "nbranch review request {id}: please review land #{ticket} by {agent} ({commits} commit(s), {base}..{head}). \
          It is checked out at {wt} (don't modify it); see the change with `git -C {wt} diff {base} {head}`. \
+         From an nbranch clone on another machine, run `nbranch review-checkout {id}` instead to check it out there. \
          When you're done, run `nbranch respond {id} accept` or \
          `nbranch respond {id} reject --comment 'path:line: error: what is wrong'` (repeat --comment as needed), \
          passing --model <your model id> or setting NBRANCH_MODEL. Responding acks this message. \

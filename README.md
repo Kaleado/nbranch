@@ -80,6 +80,8 @@ nbranch tui                            # watch the queue and the trunk
 | `nbranch gc [--idle D] [--force] [--dry-run]` | Remove worktrees that are idle (default `gc_idle`), clean and fully landed. `--force` also removes ones with unlanded commits. Also cleans up leftover temporary worktrees |
 | `nbranch tui` | [Live view](#tui) of the queue, the trunk and recent results |
 | `nbranch whoami` | Show the caller's nick and worktree |
+| `nbranch clone <host>:<root> [dir] [--hub-command C]` | Clone a root on another machine over SSH (see [Agents on other machines](#agents-on-other-machines)) |
+| `nbranch review-checkout <request>` | Print where a review request's change is checked out (in a clone, fetching it first) |
 | `nbranch review-agent [--nick <nick> \| --queue <queue>]` | Reviewer command that queues a review request for a review agent (see [Review agent](#review-agent)) |
 | `nbranch requests [--json]` | List review requests waiting for the caller |
 | `nbranch respond <request> accept\|reject [--comment C]... [--model M]` | Answer a review request |
@@ -341,6 +343,52 @@ lease-secs = 3600           # at least as long as a review may take
 max-in-flight = 1           # one review per reviewer at a time
 ```
 
+### Agents on other machines
+
+An agent on another machine works in a **clone** of a root (the **hub**),
+reached over SSH, while the queue, golden and reviewers stay on the hub:
+
+```sh
+nqueue tunnel me@hub &                  # so land results and review requests reach this machine
+export NQUEUE_VALKEY=valkey+unix://$HOME/.nqueue/tunnels/me@hub.sock
+nbranch clone me@hub:work/myproj        # a git clone of golden, on branch nbranch/<nick>
+cd myproj && ...edit, commit...
+nbranch land                            # pushes nbranch/<nick> to golden, then lands it on the hub
+```
+
+- A clone is an ordinary git clone with its hub recorded in git config
+  (`nbranch.hub`, `nbranch.root`, `nbranch.agent`, ...); nbranch commands run
+  inside it act on the hub
+  - `land` force-pushes `nbranch/<nick>` to golden (it's the agent's own
+    branch), then runs `nbranch land` on the hub. Everything from there is
+    the same as for a local agent: the snapshot, reviewers, the pick and the
+    trunk update all happen on the hub, and the result arrives over nchat
+  - `sync` and `reset` fetch the hub's trunk and rebase or reset the clone;
+    `reset` asks the hub which of the agent's lands made it
+  - `queue`, `show`, `log`, `cancel`, `requests` and `respond` run on the hub;
+    `tui` runs there with a terminal (`ssh -t`)
+  - `gc` and `review-agent` only run on the hub
+- A clone belongs to the nick that made it. An agent can have a worktree on
+  the hub or clones elsewhere, not both: `clone` refuses a nick with a hub
+  worktree. Recloning picks up the agent's branch where it was
+- Commands on the hub run as `<hub command> --root <root>` over SSH, with
+  `NBRANCH_AGENT` set. Non-interactive SSH sessions often have a shorter
+  `PATH`, so `--hub-command ~/.cargo/bin/nbranch` may be needed
+- SSH options come from `~/.ssh/config`; `NBRANCH_SSH` picks another ssh (git
+  uses it too, unless `GIT_SSH_COMMAND` is set)
+- `setup_command` from the hub's configs isn't run in clones, since its paths
+  are the hub's. A clone runs the `setup_command` from its own machine's global
+  config, with `NBRANCH_WORKTREE_KIND=clone`
+- Anyone with SSH access to the hub can already do anything there; clones
+  don't change nbranch's cooperative trust model
+
+**Review agents** can work from a clone too. Each review request gets a ref in
+golden, `refs/nbranch/reviews/<request>`, holding the commit under review (an
+in-queue result is on no branch). `nbranch review-checkout <request>` fetches
+it into a worktree under the clone's `.git/nbranch/reviews/`, prints its
+path, and removes checkouts of finished reviews. The ref is deleted when the
+review is answered, and `gc` removes any left by reviewers that timed out.
+
 ### Agent skill
 
 [`skills/nbranch/SKILL.md`](skills/nbranch/SKILL.md) tells agents to:
@@ -360,6 +408,7 @@ cargo test     # unit tests plus end-to-end tests in tests/cli.rs
 ```
 
 The end-to-end tests drive the real binary against throwaway repositories and
-use `notify_command` to capture notifications instead of nchat. Review agent
+use `notify_command` to capture notifications instead of nchat. Clone tests
+use a fake `ssh` (via `NBRANCH_SSH`) that runs the hub's commands locally. Review agent
 tests start a private nqueue server, so they need `nqueue` (or `NQUEUE_BIN`)
 and `valkey-server` installed.

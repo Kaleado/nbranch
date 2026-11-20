@@ -1,6 +1,6 @@
 ---
 name: nbranch
-description: Work on a shared repository through nbranch - your own worktree and branch, landing changes through a local merge queue with reviewers, and answering nbranch review requests. Use when the project is an nbranch root (it has golden.git/ and agents/), when told to land changes with nbranch, or when you receive an "nbranch:" message or an "nbranch review request" (an nqueue message on an nbranch.review queue).
+description: Work on a shared repository through nbranch - your own worktree (or clone, from another machine) and branch, landing changes through a local merge queue with reviewers, and answering nbranch review requests. Use when the project is an nbranch root (it has golden.git/ and agents/) or an nbranch clone (git config nbranch.hub is set), when told to land changes with nbranch, or when you receive an "nbranch:" message or an "nbranch review request" (an nqueue message on an nbranch.review queue).
 ---
 
 # Working with nbranch
@@ -45,6 +45,17 @@ Your worktree never changes underneath you; only `nbranch sync` and
 unlanded commits or uncommitted changes unless given `--force`; don't use
 `--force` unless you mean to throw that work away.
 
+## Working from another machine
+
+When the nbranch root is on another machine (the hub), you work in a clone
+instead of a worktree: `nbranch clone <host>:<root path> [dir]`, then `cd`
+into it. Everything above applies unchanged. In the clone, `nbranch land`
+pushes your branch to the hub and queues it there; `sync` and `reset` fetch
+the hub's trunk first; `queue`, `show`, `log`, `cancel` and `requests` ask the
+hub. The clone belongs to the nick that made it. Results arrive as usual only
+if this session's nqueue reaches the hub's (the user sets that up with
+`nqueue tunnel`); if they don't, use `nbranch land --wait`.
+
 Other commands: `nbranch queue` (what's waiting), `nbranch log` (recent
 rejections with reviewer output), `nbranch cancel N`, `nbranch whoami`.
 
@@ -57,7 +68,9 @@ leased to you until you answer, so answer every one you take.
 1. If it's a review of your own land, don't review it: run
    `nqueue nack <message id>` so another reviewer gets it.
 2. Review the change at the path in the message, e.g.
-   `git -C <path> diff <base> <head>`. Don't modify files there.
+   `git -C <path> diff <base> <head>`. Don't modify files there. If you're
+   in an nbranch clone on another machine, run `nbranch review-checkout <id>`
+   instead; it prints a local path to review.
 3. Answer with your model id (or set `NBRANCH_MODEL`):
    - `nbranch respond <id> accept --model <model>`
    - `nbranch respond <id> reject --model <model> --comment 'src/x.rs:42: error: what is wrong and why'`
